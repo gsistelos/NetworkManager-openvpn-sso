@@ -238,9 +238,9 @@ nmovpn_remote_parse (const char *str,
 	}
 	g_return_val_if_fail (!error || !*error, 0);
 
-	t = strchr (str, ' ');
+	t = (char *) strchr (str, ' ');
 	if (!t)
-		t = strchr (str, ',');
+		t = (char *) strchr (str, ',');
 	if (t) {
 		g_set_error (error, NM_UTILS_ERROR, NM_UTILS_ERROR_UNKNOWN,
 		             _("invalid delimiter character '%c'"), t[0]);

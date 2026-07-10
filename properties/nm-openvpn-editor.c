@@ -735,7 +735,7 @@ sk_default_filter (const GtkFileFilterInfo *filter_info, gpointer data)
 	if (!filter_info->filename)
 		return FALSE;
 
-	p = strrchr (filter_info->filename, '.');
+	p = (char *) strrchr (filter_info->filename, '.');
 	if (!p)
 		return FALSE;
 
