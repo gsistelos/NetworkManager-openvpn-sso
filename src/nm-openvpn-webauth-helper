@@ -1,0 +1,73 @@
+#!/bin/sh
+# nm-openvpn-webauth-helper URL
+#
+# Open URL in the graphical user's default browser for OpenVPN SSO/SAML
+# web authentication. Invoked (as root) by nm-openvpn-service when the server
+# pushes a WEB_AUTH request over the management interface.
+#
+# The VPN service runs as root outside any graphical session, so it cannot
+# open a browser directly. This helper locates the active desktop session,
+# imports its environment and drops privileges to that user to launch the
+# browser -- the same approach used by GlobalProtect-SAML-NetworkManager.
+#
+# Copyright (C) 2025 Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+url="$1"
+
+# Only ever hand a http(s) URL to the browser.
+case "$url" in
+	https://* | http://*) ;;
+	*)
+		echo "nm-openvpn-webauth-helper: refusing URL with unsupported scheme" >&2
+		exit 1
+		;;
+esac
+
+# Find a process belonging to a graphical session to identify the user and
+# borrow their session environment (DISPLAY / Wayland / bus / runtime dir).
+pid=
+for comm in gnome-shell plasmashell cinnamon mate-session xfce4-session sway Hyprland; do
+	pid=$(pgrep -x "$comm" 2>/dev/null | head -n1)
+	[ -n "$pid" ] && break
+done
+
+if [ -z "$pid" ]; then
+	echo "nm-openvpn-webauth-helper: no graphical session found" >&2
+	exit 1
+fi
+
+uid=$(stat -c %u "/proc/$pid" 2>/dev/null)
+user=$(id -nu "$uid" 2>/dev/null)
+if [ -z "$user" ]; then
+	echo "nm-openvpn-webauth-helper: could not resolve session user" >&2
+	exit 1
+fi
+
+# Best-effort: pull the session variables out of the desktop process'
+# environment. Reading /proc/PID/environ of another user may be denied (the
+# service can be hardened / lack CAP_SYS_PTRACE); that is fine, we fall back to
+# values derived from the UID. The per-user bus is enough for xdg-open to reach
+# the session and launch the browser (which then picks up the display itself).
+environ=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n')
+getenv() {
+	printf '%s\n' "$environ" | sed -n "s/^$1=//p" | head -n1
+}
+
+runtime_dir=$(getenv XDG_RUNTIME_DIR)
+[ -n "$runtime_dir" ] || runtime_dir="/run/user/$uid"
+display=$(getenv DISPLAY)
+wayland_display=$(getenv WAYLAND_DISPLAY)
+dbus_addr=$(getenv DBUS_SESSION_BUS_ADDRESS)
+[ -n "$dbus_addr" ] || dbus_addr="unix:path=$runtime_dir/bus"
+xauth=$(getenv XAUTHORITY)
+
+# Drop to the session user with a minimal, explicit environment and open the
+# URL with the user's default handler.
+exec runuser -u "$user" -- env \
+	XDG_RUNTIME_DIR="$runtime_dir" \
+	DBUS_SESSION_BUS_ADDRESS="$dbus_addr" \
+	${display:+DISPLAY="$display"} \
+	${wayland_display:+WAYLAND_DISPLAY="$wayland_display"} \
+	${xauth:+XAUTHORITY="$xauth"} \
+	xdg-open "$url"

@@ -62,6 +62,7 @@ static struct {
 } gl/*obal*/;
 
 #define NM_OPENVPN_HELPER_PATH LIBEXECDIR"/nm-openvpn-service-openvpn-helper"
+#define NM_OPENVPN_WEBAUTH_HELPER_PATH LIBEXECDIR"/nm-openvpn-webauth-helper"
 
 /*****************************************************************************/
 
@@ -106,6 +107,13 @@ typedef struct {
 	char *challenge_text;
 	char *challenge_response;
 	char *challenge_flags;
+	/* OpenVPN 2.6 deferred SSO auth (AUTH_PENDING), signalled by >INFOMSG.
+	 * Distinct from the CRV1 challenge fields above, which use a different
+	 * response mechanism. */
+	char *webauth_url;      /* last WEB_AUTH/OPEN_URL opened in a browser (de-dup) */
+	char *cr_text;          /* CR_TEXT challenge text pending a user response */
+	char *cr_flags;         /* CR_TEXT flags: "E" (echo), "R" (response required) */
+	gboolean auth_pending;  /* a CR_TEXT response is being collected from the user */
 	GIOChannel *socket_channel;
 	guint socket_channel_eventid;
 } NMOpenvpnPluginIOData;
@@ -865,6 +873,17 @@ nm_openvpn_disconnect_management_socket (NMOpenvpnPlugin *plugin)
 	g_free (io_data->proxy_password);
 	g_free (io_data->challenge_state_id);
 	g_free (io_data->challenge_text);
+	g_free (io_data->challenge_flags);
+
+	if (io_data->challenge_response)
+		memset (io_data->challenge_response, 0, strlen (io_data->challenge_response));
+	g_free (io_data->challenge_response);
+
+	g_free (io_data->webauth_url);
+	g_free (io_data->cr_flags);
+	if (io_data->cr_text)
+		memset (io_data->cr_text, 0, strlen (io_data->cr_text));
+	g_free (io_data->cr_text);
 
 	g_free (priv->io_data);
 	priv->io_data = NULL;
@@ -942,6 +961,47 @@ parse_challenge (const char *failure_reason, char **challenge_state_id, char **c
 	return TRUE;
 }
 
+/* Parse the payload of an OpenVPN 2.6 ">INFOMSG:<extra>" AUTH_PENDING message:
+ *   "WEB_AUTH:<flags>:<url>"   -> kind "webauth", flags, payload = url
+ *   "OPEN_URL:<url>"           -> kind "webauth", flags = NULL, payload = url (deprecated)
+ *   "CR_TEXT:<flags>:<text>"   -> kind "crtext",  flags, payload = challenge text
+ * The url/text may contain ':' so we only split on the leading field separators
+ * and copy the remainder verbatim. Returns FALSE for unrecognized payloads. */
+static gboolean
+parse_infomsg (const char *extra, char **out_kind, char **out_flags, char **out_payload)
+{
+	const char *sep;
+	const char *rest;
+
+	*out_kind = NULL;
+	*out_flags = NULL;
+	*out_payload = NULL;
+
+	if (g_str_has_prefix (extra, "OPEN_URL:")) {
+		*out_kind = g_strdup ("webauth");
+		*out_payload = g_strdup (extra + NM_STRLEN ("OPEN_URL:"));
+		return TRUE;
+	}
+
+	if (g_str_has_prefix (extra, "WEB_AUTH:"))
+		*out_kind = g_strdup ("webauth");
+	else if (g_str_has_prefix (extra, "CR_TEXT:"))
+		*out_kind = g_strdup ("crtext");
+	else
+		return FALSE;
+
+	/* Both WEB_AUTH and CR_TEXT are "<PREFIX>:<flags>:<payload>". */
+	rest = strchr (extra, ':') + 1;    /* after the leading prefix colon */
+	sep = strchr (rest, ':');          /* end of the flags field */
+	if (!sep) {
+		nm_clear_g_free (out_kind);
+		return FALSE;
+	}
+	*out_flags = g_strndup (rest, sep - rest);
+	*out_payload = g_strdup (sep + 1);
+	return TRUE;
+}
+
 static void
 write_user_pass (GIOChannel *channel,
                  const char *authtype,
@@ -960,6 +1020,26 @@ write_user_pass (GIOChannel *channel,
 	memset (qpass, 0, strlen (qpass));
 	g_free (qpass);
 	g_free (quser);
+
+	/* Will always write everything in blocking channels (on success) */
+	g_io_channel_write_chars (channel, buf, strlen (buf), NULL, NULL);
+	g_io_channel_flush (channel, NULL);
+
+	memset (buf, 0, strlen (buf));
+	g_free (buf);
+}
+
+/* Send the response to an AUTH_PENDING text challenge (crtext) back to
+ * openvpn via the management "cr-response" command. The argument is the
+ * base64 encoding of the raw user response. */
+static void
+write_cr_response (GIOChannel *channel, const char *response)
+{
+	gs_free char *b64 = NULL;
+	char *buf;
+
+	b64 = g_base64_encode ((const guchar *) response, strlen (response));
+	buf = g_strdup_printf ("cr-response %s\n", b64);
 
 	/* Will always write everything in blocking channels (on success) */
 	g_io_channel_write_chars (channel, buf, strlen (buf), NULL, NULL);
@@ -1097,6 +1177,38 @@ _request_secrets (NMOpenvpnPlugin *plugin,
 	nm_vpn_service_plugin_secrets_required ((NMVpnServicePlugin *) plugin, message, (const char **) hints);
 }
 
+static void
+_webauth_child_watch (GPid pid, gint status, gpointer user_data)
+{
+	g_spawn_close_pid (pid);
+}
+
+/* Launch URL in the graphical user's browser for web (SSO/SAML) authentication.
+ * This service runs as root outside any session, so a small helper locates the
+ * active desktop session and opens the browser there. */
+static gboolean
+open_webauth_browser (const char *url)
+{
+	const char *argv[] = { NM_OPENVPN_WEBAUTH_HELPER_PATH, url, NULL };
+	gs_free_error GError *error = NULL;
+	GPid pid;
+
+	if (!g_spawn_async (NULL,
+	                    (char **) argv,
+	                    NULL,
+	                    G_SPAWN_DO_NOT_REAP_CHILD,
+	                    NULL,
+	                    NULL,
+	                    &pid,
+	                    &error)) {
+		_LOGW ("Could not launch web authentication helper: %s", error->message);
+		return FALSE;
+	}
+
+	g_child_watch_add (pid, _webauth_child_watch, NULL);
+	return TRUE;
+}
+
 static gboolean
 handle_management_socket (NMOpenvpnPlugin *plugin,
                           GIOChannel *source,
@@ -1123,6 +1235,17 @@ handle_management_socket (NMOpenvpnPlugin *plugin,
 	}
 
 	_LOGD ("VPN request '%s'", str);
+
+	/* openvpn was started with --management-hold and waits for us to release
+	 * it. Do so now that we are connected and listening, so that subsequent
+	 * one-shot notifications (e.g. deferred-auth >INFOMSG) are not missed. */
+	if (g_str_has_prefix (str, ">HOLD:")) {
+		const char *release = "hold release\n";
+
+		g_io_channel_write_chars (source, release, strlen (release), NULL, NULL);
+		g_io_channel_flush (source, NULL);
+		goto out;
+	}
 
 	auth = get_detail (str, ">PASSWORD:Need '");
 	if (auth) {
@@ -1189,6 +1312,80 @@ handle_management_socket (NMOpenvpnPlugin *plugin,
 		}
 
 		g_free (auth);
+		goto out;
+	}
+
+	/* OpenVPN 2.6 deferred SSO authentication (AUTH_PENDING). The server asks
+	 * us to complete a second factor via a web browser (webauth/SAML) or a
+	 * text challenge (crtext), signalled by an unsolicited >INFOMSG: line. */
+	if (g_str_has_prefix (str, ">INFOMSG:")) {
+		gs_free char *line = g_strchomp (g_strdup (str));
+		gs_free char *kind = NULL;
+		gs_free char *flags = NULL;
+		gs_free char *payload = NULL;
+
+		if (!parse_infomsg (line + NM_STRLEN (">INFOMSG:"), &kind, &flags, &payload)) {
+			/* Not an auth-related INFOMSG we handle; ignore it. */
+			goto out;
+		}
+
+		if (nm_streq (kind, "webauth")) {
+			if (   !g_str_has_prefix (payload, "https://")
+			    && !g_str_has_prefix (payload, "http://")) {
+				_LOGW ("Ignoring web authentication URL with unsupported scheme");
+				*out_failure = NM_VPN_PLUGIN_FAILURE_LOGIN_FAILED;
+				again = FALSE;
+				goto out;
+			}
+
+			/* openvpn may repeat the message; don't re-open the same URL. */
+			if (nm_streq0 (priv->io_data->webauth_url, payload))
+				goto out;
+
+			g_free (priv->io_data->webauth_url);
+			priv->io_data->webauth_url = g_strdup (payload);
+
+			_LOGD ("Received web authentication request for URL '%s'", payload);
+
+			/* The VPN server completes SSO/SAML out-of-band once the user logs
+			 * in with the identity provider, so there is nothing to send back:
+			 * just open the URL in the user's browser and keep waiting for
+			 * openvpn to proceed. We cannot open a browser from this (root,
+			 * session-less) service, so a helper locates the graphical session
+			 * and launches it there. */
+			if (!open_webauth_browser (payload))
+				_LOGW ("Failed to launch browser for web authentication");
+		} else {
+			/* crtext: a text challenge (e.g. a TOTP code) delivered via
+			 * AUTH_PENDING. Distinct from the CRV1 challenge above: the
+			 * response is sent back with the "cr-response" command, not as
+			 * a "password CRV1::..." reply. Unlike webauth this needs input
+			 * from the user, so it still goes through a secret agent. */
+			const char *hints[2];
+
+			if (!priv->interactive) {
+				_LOGW ("Text challenge authentication required but cannot ask interactively");
+				*out_failure = NM_VPN_PLUGIN_FAILURE_LOGIN_FAILED;
+				again = FALSE;
+				goto out;
+			}
+
+			priv->io_data->auth_pending = TRUE;
+			nm_clear_g_free (&priv->io_data->pending_auth);
+			g_free (priv->io_data->cr_text);
+			priv->io_data->cr_text = g_strdup (payload);
+			g_free (priv->io_data->cr_flags);
+			priv->io_data->cr_flags = g_strdup (flags ? flags : "");
+
+			_LOGD ("Received text challenge '%s' with flags '%s'", payload, priv->io_data->cr_flags);
+
+			hints[0] = (flags && strchr (flags, 'E'))
+			           ? NM_OPENVPN_HINT_CHALLENGE_RESPONSE_ECHO
+			           : NM_OPENVPN_HINT_CHALLENGE_RESPONSE_NOECHO;
+			hints[1] = NULL;
+			_request_secrets (plugin, priv->io_data->cr_text, hints);
+		}
+		goto out;
 	}
 
 out:
@@ -2070,6 +2267,12 @@ nm_openvpn_start_openvpn_binary (NMOpenvpnPlugin *plugin,
 	args_add_strv (args, "--management-query-passwords");
 	args_add_strv (args, "--auth-retry", "interact");
 
+	/* Hold openvpn until our management client has connected, then release it
+	 * (see the >HOLD handler). Without this, openvpn may push one-shot
+	 * notifications such as the deferred-auth >INFOMSG:WEB_AUTH before we have
+	 * connected to the socket, and they would be lost. */
+	args_add_strv (args, "--management-hold");
+
 	/* do not let openvpn setup routes or addresses, NM will handle it */
 	args_add_strv (args, "--route-noexec");
 	args_add_strv (args, "--ifconfig-noexec");
@@ -2077,6 +2280,14 @@ nm_openvpn_start_openvpn_binary (NMOpenvpnPlugin *plugin,
 	tmp = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PUSH_PEER_INFO);
 	if (nm_streq0 (tmp, "yes"))
 		args_add_strv (args, "--push-peer-info");
+
+	/* Advertise support for browser-based (webauth/SAML) and text (crtext)
+	 * SSO to the server. openvpn's push_peer_info() picks up the IV_SSO
+	 * environment variable and sends it as peer-info. Only meaningful for
+	 * TLS modes (static-key has no control channel / peer-info). Advertising
+	 * is harmless when the server does not use deferred authentication. */
+	if (connection_type_is_tls_mode (connection_type))
+		args_add_strv (args, "--setenv", "IV_SSO", "webauth,crtext");
 
 	/* Now append configuration options which are dependent on the configuration type */
 	if (nm_streq (connection_type, NM_OPENVPN_CONTYPE_TLS)) {
@@ -2377,6 +2588,22 @@ real_new_secrets (NMVpnServicePlugin *base_plugin,
 	_LOGD ("VPN received new secrets; sending to management interface");
 
 	update_io_data_from_vpn_setting (priv->io_data, s_vpn, NULL);
+
+	/* An AUTH_PENDING text challenge (crtext) round: there is no >PASSWORD:Need
+	 * pending, and the response goes back via the "cr-response" management
+	 * command rather than as a password. (webauth needs no secret round-trip:
+	 * the browser is opened directly and the server completes auth out-of-band.) */
+	if (priv->io_data->auth_pending && !priv->io_data->pending_auth) {
+		if (priv->io_data->challenge_response) {
+			write_cr_response (priv->io_data->socket_channel,
+			                   priv->io_data->challenge_response);
+			nm_clear_g_free (&priv->io_data->challenge_response);
+		}
+		nm_clear_g_free (&priv->io_data->cr_text);
+		nm_clear_g_free (&priv->io_data->cr_flags);
+		priv->io_data->auth_pending = FALSE;
+		return TRUE;
+	}
 
 	g_warn_if_fail (priv->io_data->pending_auth);
 	if (!handle_auth (priv->io_data, priv->io_data->pending_auth, &message, &hints)) {

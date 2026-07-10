@@ -93,6 +93,10 @@ src_nm_openvpn_service_openvpn_helper_LDADD = \
 EXTRA_src_nm_openvpn_service_openvpn_helper_DEPENDENCIES = \
 	linker-script-binary.ver
 
+# Helper that opens the browser in the user's session for web (SSO/SAML) auth.
+libexec_SCRIPTS = src/nm-openvpn-webauth-helper
+EXTRA_DIST += src/nm-openvpn-webauth-helper
+
 ###############################################################################
 
 properties/resources.h: properties/gresource.xml
