@@ -62,7 +62,30 @@ dbus_addr=$(getenv DBUS_SESSION_BUS_ADDRESS)
 [ -n "$dbus_addr" ] || dbus_addr="unix:path=$runtime_dir/bus"
 xauth=$(getenv XAUTHORITY)
 
-# Drop to the session user with a minimal, explicit environment and open the
+# Preferred path: hand the URL to the user's own systemd manager. It launches
+# the browser *inside* the user's session scope -- correct cgroup, a real
+# logind session and the authoritative session environment (DISPLAY / Wayland /
+# bus / runtime dir), including the variables needed to activate the desktop's
+# D-Bus portals. This is required on modern systemd desktops, and in particular
+# under Wayland (Plasma, GNOME, sway...), where runuser's faked environment and
+# out-of-session cgroup make xdg-open silently fail to open a window. It also
+# avoids depending on reading /proc/PID/environ, which a hardened service may be
+# denied.
+# KillMode=process is required: xdg-open forks the browser and returns almost
+# immediately, which ends the transient unit. With the default
+# KillMode=control-group systemd would then kill the whole cgroup, taking the
+# just-forked browser with it before it maps a window (observed on GNOME/Wayland
+# as xdg-open exiting 0 yet nothing opening). KillMode=process signals only the
+# already-exited main process, so the browser survives.
+if command -v systemd-run >/dev/null 2>&1 &&
+   systemctl --user --machine="$user@.host" show-environment >/dev/null 2>&1; then
+	exec systemd-run --user --machine="$user@.host" --collect -q \
+		-p KillMode=process -- \
+		xdg-open "$url"
+fi
+
+# Fallback for systems without a systemd user manager (OpenRC, runit, s6...):
+# drop to the session user with a minimal, explicit environment and open the
 # URL with the user's default handler.
 exec runuser -u "$user" -- env \
 	XDG_RUNTIME_DIR="$runtime_dir" \
