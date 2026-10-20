@@ -1209,6 +1209,13 @@ open_webauth_browser (const char *url)
 	return TRUE;
 }
 
+/* INFOMSG can carry one-use login URLs or authentication challenge data. */
+static const char *
+management_log_message (const char *message)
+{
+	return g_str_has_prefix (message, ">INFOMSG:") ? ">INFOMSG:[redacted]" : message;
+}
+
 static gboolean
 handle_management_socket (NMOpenvpnPlugin *plugin,
                           GIOChannel *source,
@@ -1234,7 +1241,7 @@ handle_management_socket (NMOpenvpnPlugin *plugin,
 		return TRUE;
 	}
 
-	_LOGD ("VPN request '%s'", str);
+	_LOGD ("VPN request '%s'", management_log_message (str));
 
 	/* openvpn was started with --management-hold and waits for us to release
 	 * it. Do so now that we are connected and listening, so that subsequent
@@ -1345,7 +1352,7 @@ handle_management_socket (NMOpenvpnPlugin *plugin,
 			g_free (priv->io_data->webauth_url);
 			priv->io_data->webauth_url = g_strdup (payload);
 
-			_LOGD ("Received web authentication request for URL '%s'", payload);
+			_LOGD ("Received web authentication request");
 
 			/* The VPN server completes SSO/SAML out-of-band once the user logs
 			 * in with the identity provider, so there is nothing to send back:

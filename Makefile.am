@@ -408,6 +408,12 @@ nm-openvpn-tmpfiles.conf: $(srcdir)/nm-openvpn-tmpfiles.conf.in
 	$(AM_V_GEN) sed -e 's|[@]LOCALSTATEDIR[@]|$(localstatedir)|g' \
 	    $^ >$@
 
+# Exercise internal management-protocol handlers without starting a VPN service.
+check_programs += src/tests/test-webauth
+src_tests_test_webauth_SOURCES = src/tests/test-webauth.c
+src_tests_test_webauth_CPPFLAGS = $(src_cppflags)
+src_tests_test_webauth_LDADD = src/libnm-utils.la $(GLIB_LIBS) $(LIBNM_LIBS)
+
 # we always build the tests during regular build.
 noinst_PROGRAMS += $(check_programs)
 
