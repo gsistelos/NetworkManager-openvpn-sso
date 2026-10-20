@@ -77,3 +77,5 @@ properties/tests/test-import-export-glib
 properties/resources.[ch]
 /NetworkManager-openvpn*.tar*
 /po/NetworkManager-openvpn.pot
+
+/src/tests/test-webauth
